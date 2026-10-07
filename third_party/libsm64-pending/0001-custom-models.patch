@@ -1,0 +1,1026 @@
+diff --git a/src/decomp/engine/geo_layout.c b/src/decomp/engine/geo_layout.c
+index ae40125..e688d1d 100644
+--- a/src/decomp/engine/geo_layout.c
++++ b/src/decomp/engine/geo_layout.c
+@@ -10,6 +10,13 @@ static Vec3s gVec3sZero = { 0, 0, 0 };
+ 
+ typedef void (*GeoLayoutCommandProc)(void);
+ 
++static void geo_layout_cmd_coop_background_ext(void);
++static void geo_layout_cmd_coop_switch_case_ext(void);
++static void geo_layout_cmd_coop_generated_ext(void);
++static void geo_layout_cmd_coop_bone(void);
++extern Gfx *sm64_geo_asm_stub(s32 callContext, struct GraphNode *node, void *context);
++extern Gfx *sm64_geo_switch_stub(s32 callContext, struct GraphNode *node, void *context);
++
+ GeoLayoutCommandProc GeoLayoutJumpTable[] = {
+     geo_layout_cmd_branch_and_link,
+     geo_layout_cmd_end,
+@@ -44,6 +51,11 @@ GeoLayoutCommandProc GeoLayoutJumpTable[] = {
+     geo_layout_cmd_nop2,
+     geo_layout_cmd_nop3,
+     geo_layout_cmd_node_culling_radius,
++    // Mario Mode: sm64coopdx's commands, so its models load
++    geo_layout_cmd_coop_background_ext,
++    geo_layout_cmd_coop_switch_case_ext,
++    geo_layout_cmd_coop_generated_ext,
++    geo_layout_cmd_coop_bone,
+ };
+ 
+ struct GraphNode gObjParentGraphNode;
+@@ -769,6 +781,58 @@ void geo_layout_cmd_node_culling_radius(void) {
+     gGeoLayoutCommand += 0x04 << CMD_SIZE_SHIFT;
+ }
+ 
++/*
++  Mario Mode - sm64coopdx's extended commands (include/geo_commands.h there).
++  0x21: background with a Lua function - skipped.
++*/
++static void geo_layout_cmd_coop_background_ext(void) {
++    gGeoLayoutCommand += 0x08 << CMD_SIZE_SHIFT;
++}
++
++/*
++  0x22: switch case with a Lua function: case 0.
++   cmd+0x02: s16 numCases
++*/
++static void geo_layout_cmd_coop_switch_case_ext(void) {
++    struct GraphNodeSwitchCase *graphNode =
++        init_graph_node_switch_case(gGraphNodePool, NULL, cur_geo_cmd_s16(0x02), 0,
++                                    (GraphNodeFunc) sm64_geo_switch_stub, 0);
++    register_scene_graph_node(&graphNode->fnNode.node);
++    gGeoLayoutCommand += 0x08 << CMD_SIZE_SHIFT;
++}
++
++/*
++  0x23: generated display list with a Lua function: draws nothing.
++*/
++static void geo_layout_cmd_coop_generated_ext(void) {
++    struct GraphNodeGenerated *graphNode =
++        init_graph_node_generated(gGraphNodePool, NULL, (GraphNodeFunc) sm64_geo_asm_stub, cur_geo_cmd_s16(0x02));
++    register_scene_graph_node(&graphNode->fnNode.node);
++    gGeoLayoutCommand += 0x08 << CMD_SIZE_SHIFT;
++}
++
++/*
++  0x24: a bone - an animated part with a rest rotation (and optional scale).
++  Here an animated part: the rest rotation and scale are left out.
++   cmd+0x01: u8 params (0x80: scale follows; 0x0F: drawing layer)
++   cmd+0x04: s16 translation x, y, z; cmd+0x0A: s16 rotation x, y, z
++  [cmd+0x10: u32 scale x, y, z]
++   then: void *displayList
++*/
++static void geo_layout_cmd_coop_bone(void) {
++    struct GraphNodeAnimatedPart *graphNode;
++    s32 params = cur_geo_cmd_u8(0x01);
++    s32 dlOffset = (params & 0x80) ? 0x1C : 0x10;
++    Vec3s translation;
++    translation[0] = cur_geo_cmd_s16(0x04);
++    translation[1] = cur_geo_cmd_s16(0x06);
++    translation[2] = cur_geo_cmd_s16(0x08);
++    graphNode = init_graph_node_animated_part(gGraphNodePool, NULL, params & 0x0F, cur_geo_cmd_ptr(dlOffset),
++                                              translation);
++    register_scene_graph_node(&graphNode->node);
++    gGeoLayoutCommand += (dlOffset + 4) << CMD_SIZE_SHIFT;
++}
++
+ struct GraphNode *process_geo_layout(struct AllocOnlyPool *pool, void *segptr) {
+     // set by register_scene_graph_node when gCurGraphNodeIndex is 0
+     // and gCurRootGraphNode is NULL
+@@ -789,8 +853,15 @@ struct GraphNode *process_geo_layout(struct AllocOnlyPool *pool, void *segptr) {
+     gGeoLayoutStack[0] = 0;
+     gGeoLayoutStack[1] = 0;
+ 
++    // Mario Mode: custom models' layouts come from files - an unknown command
++    // or a layout that never ends stops here instead of running off.
++    s32 commands = 0;
+     while (gGeoLayoutCommand != NULL) {
+-        GeoLayoutJumpTable[gGeoLayoutCommand[0x00]]();
++        u8 type = gGeoLayoutCommand[0x00];
++        if (type >= sizeof(GeoLayoutJumpTable) / sizeof(GeoLayoutJumpTable[0]) || ++commands > 200000) {
++            break;
++        }
++        GeoLayoutJumpTable[type]();
+     }
+ 
+     return gCurRootGraphNode;
+diff --git a/src/decomp/game/rendering_graph_node.c b/src/decomp/game/rendering_graph_node.c
+index 97bfed4..71fdf5b 100644
+--- a/src/decomp/game/rendering_graph_node.c
++++ b/src/decomp/game/rendering_graph_node.c
+@@ -169,20 +169,15 @@ static void geo_process_master_list_sub(struct GraphNodeMasterList *node) {
+         gSPSetGeometryMode(gDisplayListHead++, G_ZBUFFER);
+     }
+ 
+-    // libsm64 HACK 
+-    // Mario ends up in the second master list for some reason.
+-    // The first item in the list is the projection matrix that is uninitialized, so just skip it.
+-    int xx = FALSE;
++    // Mario Mode: generated lists (render mode and alpha set-up from geo
++    // functions) are never appended (see geo_process_generated_list), so every
++    // item is a model display list; this used to skip the first item, which
++    // dropped a body part whenever the vanish cap moved the generated one.
+     for (i = 1; i < GFX_NUM_MASTER_LISTS; i++) {
+         if ((currList = node->listHeads[i]) != NULL) {
+ //          gDPSetRenderMode(gDisplayListHead++, modeList->modes[i], mode2List->modes[i]);
++            gfx_adapter_set_layer(i);
+             while (currList != NULL) {
+-                if( !xx ) {
+-                    xx = TRUE;
+-                    currList = currList->next;
+-                    continue;
+-                }
+-
+                 gSPMatrix(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(currList->transform),
+                           G_MTX_MODELVIEW | G_MTX_LOAD | G_MTX_NOPUSH);
+                 gSPDisplayList(gDisplayListHead++, currList->displayList);
+@@ -519,9 +514,10 @@ static void geo_process_generated_list(struct GraphNodeGenerated *node) {
+         Gfx *list = node->fnNode.func(GEO_CONTEXT_RENDER, &node->fnNode.node,
+                                      (struct AllocOnlyPool *) gMatStack[gMatStackIndex]);
+ 
+-        if (list != NULL) {
+-            geo_append_display_list((void *) VIRTUAL_TO_PHYSICAL(list), node->fnNode.node.flags >> 8);
+-        }
++        // Mario Mode: a generated list only sets render modes and colours in
++        // N64 commands the adapter can't read - its geo function's other
++        // effects (layer, switch cases) are what matter.
++        (void) list;
+     }
+     if (node->fnNode.node.children != NULL) {
+         geo_process_node_and_siblings(node->fnNode.node.children);
+diff --git a/src/gfx_adapter.c b/src/gfx_adapter.c
+index ba7fc1d..2cccab3 100644
+--- a/src/gfx_adapter.c
++++ b/src/gfx_adapter.c
+@@ -1,5 +1,6 @@
+ #include <stdlib.h>
+ #include <string.h>
++#include <math.h>
+ 
+ #include "libsm64.h"
+ #include "decomp/engine/math_util.h"
+@@ -23,6 +24,12 @@ static float *s_colorPtr;
+ static float *s_normalPtr;
+ static float *s_uvPtr;
+ 
++// Mario Mode: the material word per triangle, the layer being drawn, custom
++// display lists.
++static uint32_t *s_materialPtr;
++static int s_layer = 1;
++static const uint8_t *s_customBegin, *s_customEnd;
++
+ static void mtxf_mul_vec3f_x(Mat4 mtx, Vec3f b, float w, Vec3f out)
+ {
+     out[0] = b[0] * mtx[0][0] + b[1] * mtx[1][0] + b[2] * mtx[2][0] + w * mtx[3][0];
+@@ -39,8 +46,34 @@ static void convert_uv_to_atlas( float *atlas_uv_out, short tc[] )
+     atlas_uv_out[1] = v * s_texHeight / 64.0f;
+ }
+ 
++// Room for one more triangle in the caller's buffers?
++static int room_for_triangle( void )
++{
++    return s_outBuffers && s_outBuffers->numTrianglesUsed < SM64_GEO_MAX_TRIANGLES;
++}
++
++static void finish_triangle( uint32_t material )
++{
++    if( s_materialPtr ) *s_materialPtr++ = material;
++    s_outBuffers->numTrianglesUsed = (uint16_t)((s_trianglePtr - s_outBuffers->position) / 9);
++}
++
++static void process_display_list( void *dl );
++static void process_f3d_display_list( const uintptr_t *dl, int depth );
++
++static int is_custom_display_list( const void *dl )
++{
++    return s_customBegin && (const uint8_t *)dl >= s_customBegin && (const uint8_t *)dl < s_customEnd;
++}
++
+ static void process_display_list( void *dl )
+ {
++    if( is_custom_display_list( dl ))
++    {
++        process_f3d_display_list( (const uintptr_t *)dl, 0 );
++        return;
++    }
++
+     intptr_t *ptr = (intptr_t *)dl;
+     Vtx *vdata = NULL;
+ 
+@@ -48,7 +81,7 @@ static void process_display_list( void *dl )
+     {
+         switch( *ptr++ )
+         {
+-            case GFXCMD_VertexData: 
++            case GFXCMD_VertexData:
+             {
+                 UNUSED intptr_t v = *ptr++;
+                 UNUSED intptr_t n = *ptr++;
+@@ -64,6 +97,9 @@ static void process_display_list( void *dl )
+                 intptr_t v02 = *ptr++;
+                 UNUSED intptr_t flag0 = *ptr++;
+ 
++                if( !room_for_triangle() )
++                    break;
++
+                 float x0 = vdata[v00].v.ob[0], y0 = vdata[v00].v.ob[1], z0 = vdata[v00].v.ob[2];
+                 float x1 = vdata[v01].v.ob[0], y1 = vdata[v01].v.ob[1], z1 = vdata[v01].v.ob[2];
+                 float x2 = vdata[v02].v.ob[0], y2 = vdata[v02].v.ob[1], z2 = vdata[v02].v.ob[2];
+@@ -106,11 +142,18 @@ static void process_display_list( void *dl )
+                 *s_colorPtr++ = s_curColor[1];
+                 *s_colorPtr++ = s_curColor[2];
+ 
++                uint32_t material = 0;
+                 if( s_textureOn )
+                 {
+                     convert_uv_to_atlas( s_uvPtr, vdata[v00].v.tc ); s_uvPtr += 2;
+                     convert_uv_to_atlas( s_uvPtr, vdata[v01].v.tc ); s_uvPtr += 2;
+                     convert_uv_to_atlas( s_uvPtr, vdata[v02].v.tc ); s_uvPtr += 2;
++                    // The ROM atlas (slot 0); the colour shows where the
++                    // texture is transparent. The wing cap's wings are cut out.
++                    material = SM64_MAT_TEXTURED | (2u << SM64_MAT_COLOR_SHIFT) | (2u << SM64_MAT_WRAP_S_SHIFT) |
++                               (2u << SM64_MAT_WRAP_T_SHIFT) | (255u << SM64_MAT_A_SHIFT);
++                    if( s_textureIndex == mario_texture_wings_half_1 || s_textureIndex == mario_texture_wings_half_2 )
++                        material |= (1u << SM64_MAT_ALPHA_SHIFT) | SM64_MAT_CUTOUT;
+                 }
+                 else
+                 {
+@@ -120,10 +163,10 @@ static void process_display_list( void *dl )
+                     *s_uvPtr++ = 1.0f;
+                     *s_uvPtr++ = 1.0f;
+                     *s_uvPtr++ = 1.0f;
++                    material = 255u << SM64_MAT_A_SHIFT;
+                 }
+ 
+-                s_outBuffers->numTrianglesUsed = (uint16_t)((s_trianglePtr - s_outBuffers->position) / 9);
+-
++                finish_triangle( material );
+                 break;
+             }
+ 
+@@ -139,7 +182,7 @@ static void process_display_list( void *dl )
+                     s_curColor[1] = (float)data->l.col[1] / 255.0f;
+                     s_curColor[2] = (float)data->l.col[2] / 255.0f;
+                 }
+-                
++
+                 break;
+             }
+ 
+@@ -176,7 +219,7 @@ static void process_display_list( void *dl )
+ 
+                 s_uls = (uint16_t)uls;
+                 s_ult = (uint16_t)ult;
+-                
++
+                 break;
+             }
+ 
+@@ -196,6 +239,524 @@ break_top:
+     {}
+ }
+ 
++/*
++ * Mario Mode: F3DEX2 display lists of custom models (as the PC ports and
++ * DynOS lay them out: two pointer-sized words per command, pointers in w1).
++ * Only what decides a triangle's shape and look is interpreted: vertices,
++ * triangles, lights, the texture and its tile, the colour combiner, the render
++ * mode and the colours, and sub display lists.
++ */
++
++enum
++{
++    F3D_VTX = 0x01, F3D_TRI1 = 0x05, F3D_TRI2 = 0x06, F3D_QUAD = 0x07,
++    F3D_VTX_EXT = 0x11, F3D_TRI2_EXT = 0x12,
++    F3D_SETENVRGB = 0xD1, F3D_COPYMEM = 0xD2, F3D_PPARTTOCOLOR = 0xD3,
++    F3D_TEXTURE = 0xD7, F3D_GEOMETRYMODE = 0xD9, F3D_MOVEWORD = 0xDB, F3D_MOVEMEM = 0xDC,
++    F3D_DL = 0xDE, F3D_ENDDL = 0xDF, F3D_SETOTHERMODE_L = 0xE2, F3D_SETOTHERMODE_H = 0xE3,
++    F3D_SETTILESIZE = 0xF2, F3D_LOADBLOCK = 0xF3, F3D_LOADTILE = 0xF4, F3D_SETTILE = 0xF5,
++    F3D_SETPRIMCOLOR = 0xFA, F3D_SETENVCOLOR = 0xFB, F3D_SETCOMBINE = 0xFC, F3D_SETTIMG = 0xFD,
++};
++
++#define F3D_GM_PACKED_NORMALS 0x00000080u
++#define F3D_GM_LIGHTING       0x00020000u
++#define F3D_GM_TEXTURE_GEN    0x00040000u
++#define F3D_MV_LIGHT          0x0A
++#define F3D_MW_LIGHTCOL       0x0A
++#define F3D_RM_CVG_X_ALPHA    0x1000u
++#define F3D_RM_FORCE_BL       0x4000u
++#define F3D_MAX_VERTICES      64
++#define F3D_MAX_LIGHTS        32
++
++struct F3DVertex
++{
++    float pos[3];
++    float nrm[3];
++    float col[3]; // shade
++    float alpha;
++    float uv[2];
++    int hasNormal;
++};
++
++static struct
++{
++    uint32_t geometryMode;
++    uint32_t combine0, combine1;
++    uint32_t otherModeL, otherModeH;
++    uint8_t env[4], prim[4];
++    uint8_t lights[F3D_MAX_LIGHTS][3];
++    const struct SM64CustomTexture *image; // G_SETTIMG
++    const struct SM64CustomTexture *tile;  // loaded into texture memory
++    uint16_t scaleS, scaleT;
++    int textureOn;
++    uint16_t uls, ult;
++    uint8_t cms, cmt, masks, maskt;
++    struct F3DVertex vtx[F3D_MAX_VERTICES];
++} s_f3d;
++
++static uint8_t s_palette[8][3] = {
++    { 0x00, 0x00, 0xff }, { 0xff, 0x00, 0x00 }, { 0xff, 0xff, 0xff }, { 0x72, 0x1c, 0x0e },
++    { 0x73, 0x06, 0x00 }, { 0xfe, 0xc1, 0x79 }, { 0xff, 0x00, 0x00 }, { 0xff, 0x00, 0x00 },
++};
++
++void sm64_set_player_palette_internal( const uint8_t rgb[8][3] )
++{
++    memcpy( s_palette, rgb, sizeof( s_palette ));
++}
++
++void gfx_adapter_set_custom_display_lists( const void *begin, const void *end )
++{
++    s_customBegin = (const uint8_t *)begin;
++    s_customEnd = (const uint8_t *)end;
++}
++
++static void f3d_reset( void )
++{
++    memset( &s_f3d, 0, sizeof( s_f3d ));
++    s_f3d.geometryMode = F3D_GM_LIGHTING;
++    s_f3d.env[0] = s_f3d.env[1] = s_f3d.env[2] = s_f3d.env[3] = 255;
++    s_f3d.prim[0] = s_f3d.prim[1] = s_f3d.prim[2] = s_f3d.prim[3] = 255;
++    for( int i = 0; i < 2; ++i )
++        s_f3d.lights[i][0] = s_f3d.lights[i][1] = s_f3d.lights[i][2] = 0xFF;
++    // The player part colours where coop's geo_mario_set_player_colors puts
++    // them: part p's light at index 2p+2 (its shade at 2p+3).
++    for( int p = 0; p < 8; ++p )
++    {
++        memcpy( s_f3d.lights[2 * p + 2], s_palette[p], 3 );
++        for( int k = 0; k < 3; ++k ) s_f3d.lights[2 * p + 3][k] = s_palette[p][k] / 2;
++    }
++    s_f3d.scaleS = s_f3d.scaleT = 0xFFFF;
++}
++
++static float clamp01( float v ) { return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; }
++
++static void f3d_load_vertices( const struct SM64CustomVertex *v, int n, int dest )
++{
++    if( !v || n <= 0 ) return;
++    for( int i = 0; i < n; ++i )
++    {
++        if( dest + i < 0 || dest + i >= F3D_MAX_VERTICES ) break;
++        struct F3DVertex *d = &s_f3d.vtx[dest + i];
++        const struct SM64CustomVertex *s = &v[i];
++        Vec3f p = { s->pos[0], s->pos[1], s->pos[2] };
++        mtxf_mul_vec3f_x( s_curMatrix, p, 1.0f, d->pos );
++
++        int lit = (s_f3d.geometryMode & F3D_GM_LIGHTING) != 0;
++        float nx = 0, ny = 0, nz = 0;
++        d->hasNormal = 0;
++        if( lit )
++        {
++            if( s_f3d.geometryMode & F3D_GM_PACKED_NORMALS )
++            {
++                // coop: the normal is packed into `flag`, cn is a colour
++                int xo = s->flag >> 8, yo = s->flag & 0xFF;
++                int x = xo & 0x7F, y = yo & 0x7F, z = ((x + y) ^ 0x7F) & 0xFF;
++                if( z & 0x80 ) { x ^= 0x7F; y ^= 0x7F; z = (x + y) ^ 0x7F; }
++                nx = (float)((xo & 0x80) ? -x : x);
++                ny = (float)((yo & 0x80) ? -y : y);
++                nz = (float)(int8_t)z;
++            }
++            else
++            {
++                nx = (float)(int8_t)s->cn[0];
++                ny = (float)(int8_t)s->cn[1];
++                nz = (float)(int8_t)s->cn[2];
++            }
++            Vec3f n = { nx / 127.0f, ny / 127.0f, nz / 127.0f };
++            if( n[0] != 0.0f || n[1] != 0.0f || n[2] != 0.0f )
++            {
++                mtxf_mul_vec3f_x( s_curMatrix, n, 0.0f, d->nrm );
++                vec3f_normalize( d->nrm );
++                d->hasNormal = 1;
++            }
++            // The material colour: the first directional light (the game
++            // lights Mario itself).
++            for( int k = 0; k < 3; ++k )
++            {
++                float c = s_f3d.lights[0][k] / 255.0f;
++                if( s_f3d.geometryMode & F3D_GM_PACKED_NORMALS ) c *= s->cn[k] / 255.0f;
++                d->col[k] = c;
++            }
++        }
++        else
++        {
++            for( int k = 0; k < 3; ++k ) d->col[k] = s->cn[k] / 255.0f;
++        }
++        d->alpha = s->cn[3] / 255.0f;
++
++        if( lit && (s_f3d.geometryMode & F3D_GM_TEXTURE_GEN) && d->hasNormal )
++        {
++            // Environment mapping: no camera here, so map by the normal.
++            d->uv[0] = 0.5f + 0.5f * d->nrm[0];
++            d->uv[1] = 0.5f - 0.5f * d->nrm[1];
++        }
++        else
++        {
++            const struct SM64CustomTexture *t = s_f3d.tile;
++            float w = t && t->width ? (float)t->width : 32.0f;
++            float h = t && t->height ? (float)t->height : 32.0f;
++            float u = (float)((int32_t)s->st[0] * s_f3d.scaleS >> 16) / 32.0f - s_f3d.uls / 4.0f;
++            float vv = (float)((int32_t)s->st[1] * s_f3d.scaleT >> 16) / 32.0f - s_f3d.ult / 4.0f;
++            d->uv[0] = u / w;
++            d->uv[1] = vv / h;
++        }
++    }
++}
++
++// Colour combiner inputs, as far as Mario's look goes.
++enum { CC_ZERO, CC_ONE, CC_TEX, CC_TEXA, CC_SHADE, CC_PRIM, CC_ENV, CC_PRIMA, CC_ENVA, CC_SHADEA, CC_COMBINED, CC_OTHER };
++
++static int cc_rgb_a( int v ) { static const int m[16] = { CC_COMBINED, CC_TEX, CC_TEX, CC_PRIM, CC_SHADE, CC_ENV, CC_ONE, CC_OTHER }; return v < 8 ? m[v] : CC_ZERO; }
++static int cc_rgb_b( int v ) { static const int m[16] = { CC_COMBINED, CC_TEX, CC_TEX, CC_PRIM, CC_SHADE, CC_ENV, CC_OTHER, CC_OTHER }; return v < 8 ? m[v] : CC_ZERO; }
++static int cc_rgb_c( int v )
++{
++    static const int m[16] = { CC_COMBINED, CC_TEX, CC_TEX, CC_PRIM, CC_SHADE, CC_ENV, CC_OTHER, CC_OTHER,
++                               CC_TEXA, CC_TEXA, CC_PRIMA, CC_SHADEA, CC_ENVA, CC_OTHER, CC_OTHER, CC_OTHER };
++    return v < 16 ? m[v] : CC_ZERO;
++}
++static int cc_rgb_d( int v ) { static const int m[8] = { CC_COMBINED, CC_TEX, CC_TEX, CC_PRIM, CC_SHADE, CC_ENV, CC_ONE, CC_ZERO }; return m[v & 7]; }
++static int cc_alpha( int v, int isC )
++{
++    static const int ab[8] = { CC_COMBINED, CC_TEXA, CC_TEXA, CC_PRIMA, CC_SHADEA, CC_ENVA, CC_ONE, CC_ZERO };
++    static const int c[8] = { CC_OTHER, CC_TEXA, CC_TEXA, CC_PRIMA, CC_SHADEA, CC_ENVA, CC_OTHER, CC_ZERO };
++    return isC ? c[v & 7] : ab[v & 7];
++}
++
++static int cc_is_tex( int in ) { return in == CC_TEX || in == CC_TEXA; }
++// In the first cycle there is no previous result: read COMBINED as the shade.
++static int cyc1( int in ) { return in == CC_COMBINED ? CC_SHADE : in; }
++
++// The value of a non-texture input for a vertex (rgb; for alpha inputs, all three the same).
++static void cc_value( int in, const struct F3DVertex *v, float out[3] )
++{
++    float a = 1.0f;
++    switch( in )
++    {
++        case CC_ONE: out[0] = out[1] = out[2] = 1.0f; return;
++        case CC_SHADE: out[0] = v->col[0]; out[1] = v->col[1]; out[2] = v->col[2]; return;
++        case CC_PRIM: for( int k = 0; k < 3; ++k ) out[k] = s_f3d.prim[k] / 255.0f; return;
++        case CC_ENV: for( int k = 0; k < 3; ++k ) out[k] = s_f3d.env[k] / 255.0f; return;
++        case CC_PRIMA: a = s_f3d.prim[3] / 255.0f; break;
++        case CC_ENVA: a = s_f3d.env[3] / 255.0f; break;
++        case CC_SHADEA: a = v->alpha; break;
++        default: a = 0.0f; break;
++    }
++    out[0] = out[1] = out[2] = a;
++}
++
++// How a triangle's colour is made: its mode (SM64_MAT_COLOR_*) and the colour
++// per vertex that goes with it.
++static uint32_t f3d_colour( const struct F3DVertex *v[3], float out[3][3] )
++{
++    int a = cyc1( cc_rgb_a( (s_f3d.combine0 >> 20) & 0xF )), b = cyc1( cc_rgb_b( (s_f3d.combine1 >> 28) & 0xF ));
++    int c = cyc1( cc_rgb_c( (s_f3d.combine0 >> 15) & 0x1F )), d = cyc1( cc_rgb_d( (s_f3d.combine1 >> 15) & 0x7 ));
++    int texOn = s_f3d.textureOn && s_f3d.tile;
++    uint32_t mode;
++    int k0 = CC_SHADE; // the colour input that goes with the mode
++    if( !texOn || (!cc_is_tex( a ) && !cc_is_tex( b ) && !cc_is_tex( c ) && !cc_is_tex( d )))
++    {
++        // No texture: evaluate (a - b) * c + d per vertex.
++        for( int i = 0; i < 3; ++i )
++        {
++            float va[3], vb[3], vc[3], vd[3];
++            cc_value( cc_is_tex( a ) ? CC_ONE : a, v[i], va );
++            cc_value( cc_is_tex( b ) ? CC_ZERO : b, v[i], vb );
++            cc_value( cc_is_tex( c ) ? CC_ONE : c, v[i], vc );
++            cc_value( cc_is_tex( d ) ? CC_ZERO : d, v[i], vd );
++            for( int k = 0; k < 3; ++k ) out[i][k] = clamp01( (va[k] - vb[k]) * vc[k] + vd[k] );
++        }
++        return 0u << SM64_MAT_COLOR_SHIFT;
++    }
++    if( a == CC_TEX && b == CC_ZERO && d == CC_ZERO && !cc_is_tex( c )) { mode = 1; k0 = c; }
++    else if( c == CC_TEX && b == CC_ZERO && d == CC_ZERO && !cc_is_tex( a )) { mode = 1; k0 = a; }
++    else if( a == CC_ZERO && b == CC_ZERO && c == CC_ZERO && d == CC_TEX ) { mode = 3; k0 = CC_ONE; }
++    else if( d == CC_TEX && a == b ) { mode = 3; k0 = CC_ONE; }
++    else if( a == CC_TEX && c == CC_TEXA && b == d && !cc_is_tex( b )) { mode = 2; k0 = b; }
++    else if( a == CC_TEX && !cc_is_tex( c )) { mode = 1; k0 = c; }
++    else { mode = 1; k0 = CC_SHADE; }
++
++    // A second cycle that only scales the result: (COMBINED - 0) * X + 0.
++    int twoCycle = ((s_f3d.otherModeH >> 20) & 3) == 1;
++    int a2 = cc_rgb_a( (s_f3d.combine0 >> 5) & 0xF ), b2 = cc_rgb_b( (s_f3d.combine1 >> 24) & 0xF );
++    int c2 = cc_rgb_c( s_f3d.combine0 & 0x1F ), d2 = cc_rgb_d( (s_f3d.combine1 >> 6) & 0x7 );
++    int scale2 = twoCycle && a2 == CC_COMBINED && b2 == CC_ZERO && d2 == CC_ZERO && !cc_is_tex( c2 ) && c2 != CC_COMBINED;
++
++    for( int i = 0; i < 3; ++i )
++    {
++        float kv[3];
++        cc_value( k0 == CC_OTHER ? CC_SHADE : k0, v[i], kv );
++        if( scale2 )
++        {
++            float sv[3];
++            cc_value( c2, v[i], sv );
++            for( int k = 0; k < 3; ++k ) kv[k] *= sv[k];
++        }
++        for( int k = 0; k < 3; ++k ) out[i][k] = clamp01( kv[k] );
++    }
++    return mode << SM64_MAT_COLOR_SHIFT;
++}
++
++// The alpha part of the material: mode, A, and whether it is cut out or
++// dithered.
++static uint32_t f3d_alpha( const struct F3DVertex *v[3] )
++{
++    int a = cc_alpha( (s_f3d.combine0 >> 12) & 0x7, 0 ), b = cc_alpha( (s_f3d.combine1 >> 12) & 0x7, 0 );
++    int c = cc_alpha( (s_f3d.combine0 >> 9) & 0x7, 1 ), d = cc_alpha( (s_f3d.combine1 >> 9) & 0x7, 0 );
++    int texOn = s_f3d.textureOn && s_f3d.tile;
++    uint32_t mode = 0;
++    float k = 1.0f;
++    float tmp[3];
++    if( texOn && a == CC_TEXA && b == CC_ZERO && d == CC_ZERO && !cc_is_tex( c ))
++    {
++        mode = 1;
++        cc_value( c, v[0], tmp );
++        k = tmp[0];
++    }
++    else if( texOn && d == CC_TEXA && a == b ) { mode = 1; k = 1.0f; }
++    else if( texOn && (cc_is_tex( a ) || cc_is_tex( b ) || cc_is_tex( c ) || cc_is_tex( d ))) { mode = 1; k = 1.0f; }
++    else
++    {
++        // A constant (or vertex) alpha: (a - b) * c + d, averaged over the triangle.
++        float sum = 0.0f;
++        for( int i = 0; i < 3; ++i )
++        {
++            float va[3], vb[3], vc[3], vd[3];
++            cc_value( a == CC_COMBINED ? CC_ONE : a, v[i], va );
++            cc_value( b == CC_COMBINED ? CC_ZERO : b, v[i], vb );
++            cc_value( c == CC_OTHER ? CC_ONE : c, v[i], vc );
++            cc_value( d == CC_COMBINED ? CC_ONE : d, v[i], vd );
++            sum += clamp01( (va[0] - vb[0]) * vc[0] + vd[0] );
++        }
++        k = sum / 3.0f;
++        mode = k < 0.999f ? 2 : 0;
++    }
++
++    // Whether alpha matters is the render mode's (and the layer's) decision:
++    // translucent layers and blending see through (dithered here), the alpha
++    // layer and alpha tests cut out, an opaque surface ignores alpha.
++    int alphaCompare = s_f3d.otherModeL & 3;
++    int cvgAlpha = (s_f3d.otherModeL & F3D_RM_CVG_X_ALPHA) != 0;
++    int blend = (s_f3d.otherModeL & F3D_RM_FORCE_BL) != 0;
++    uint32_t flags = 0;
++    if( mode != 0 )
++    {
++        if( s_layer >= 5 || alphaCompare == 3 || (blend && !cvgAlpha && s_layer != 4) ) flags = SM64_MAT_DITHER;
++        else if( s_layer == 4 || alphaCompare == 1 || cvgAlpha ) flags = SM64_MAT_CUTOUT;
++        else mode = 0;
++    }
++    return (mode << SM64_MAT_ALPHA_SHIFT) | ((uint32_t)(clamp01( k ) * 255.0f + 0.5f) << SM64_MAT_A_SHIFT) | flags;
++}
++
++static uint32_t f3d_wrap( uint8_t cm, uint8_t mask )
++{
++    if( (cm & 2) || mask == 0 ) return 2; // clamp
++    if( cm & 1 ) return 1;                 // mirror
++    return 0;
++}
++
++static void f3d_triangle( int i0, int i1, int i2 )
++{
++    if( i0 < 0 || i1 < 0 || i2 < 0 || i0 >= F3D_MAX_VERTICES || i1 >= F3D_MAX_VERTICES || i2 >= F3D_MAX_VERTICES )
++        return;
++    if( !room_for_triangle() )
++        return;
++    const struct F3DVertex *v[3] = { &s_f3d.vtx[i0], &s_f3d.vtx[i1], &s_f3d.vtx[i2] };
++
++    // Unlit (vertex coloured) geometry has no normals: use the face's.
++    Vec3f e1, e2, fn;
++    for( int k = 0; k < 3; ++k )
++    {
++        e1[k] = v[1]->pos[k] - v[0]->pos[k];
++        e2[k] = v[2]->pos[k] - v[0]->pos[k];
++    }
++    vec3f_cross( fn, e1, e2 );
++    float len = sqrtf( fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2] );
++    if( len > 1e-12f ) { fn[0] /= len; fn[1] /= len; fn[2] /= len; } else { fn[0] = 0; fn[1] = 1; fn[2] = 0; }
++
++    float col[3][3];
++    uint32_t material = f3d_colour( v, col ) | f3d_alpha( v );
++    if( s_f3d.textureOn && s_f3d.tile )
++    {
++        material |= SM64_MAT_TEXTURED | (s_f3d.tile->slot & SM64_MAT_TEXTURE_MASK);
++        material |= f3d_wrap( s_f3d.cms, s_f3d.masks ) << SM64_MAT_WRAP_S_SHIFT;
++        material |= f3d_wrap( s_f3d.cmt, s_f3d.maskt ) << SM64_MAT_WRAP_T_SHIFT;
++    }
++
++    for( int i = 0; i < 3; ++i )
++    {
++        memcpy( s_trianglePtr, v[i]->pos, sizeof( float ) * 3 ); s_trianglePtr += 3;
++        memcpy( s_normalPtr, v[i]->hasNormal ? v[i]->nrm : fn, sizeof( float ) * 3 ); s_normalPtr += 3;
++        memcpy( s_colorPtr, col[i], sizeof( float ) * 3 ); s_colorPtr += 3;
++        if( material & SM64_MAT_TEXTURED )
++        {
++            *s_uvPtr++ = v[i]->uv[0];
++            *s_uvPtr++ = v[i]->uv[1];
++        }
++        else
++        {
++            *s_uvPtr++ = 1.0f;
++            *s_uvPtr++ = 1.0f;
++        }
++    }
++    finish_triangle( material );
++}
++
++static void f3d_set_other_mode( uint32_t *word, uint32_t w0, uint32_t w1 )
++{
++    uint32_t len = (w0 & 0xFF) + 1;
++    int32_t shift = 32 - (int32_t)((w0 >> 8) & 0xFF) - (int32_t)len;
++    if( shift < 0 || len >= 32 ) { *word = w1; return; }
++    uint32_t mask = ((1u << len) - 1u) << shift;
++    *word = (*word & ~mask) | (w1 & mask);
++}
++
++static int s_f3dCommands; // guards against runaway lists
++
++static void process_f3d_display_list( const uintptr_t *cmd, int depth )
++{
++    if( !cmd || depth > 16 ) return;
++    for( ;; )
++    {
++        if( !is_custom_display_list( cmd ) || ++s_f3dCommands > 200000 ) return;
++        uint32_t w0 = (uint32_t)cmd[0];
++        uintptr_t w1 = cmd[1];
++        uint32_t w1l = (uint32_t)w1;
++        switch( w0 >> 24 )
++        {
++            case F3D_VTX:
++            case F3D_VTX_EXT:
++            {
++                int n = (w0 >> 12) & 0xFF;
++                int end = (w0 >> 1) & 0x7F;
++                f3d_load_vertices( (const struct SM64CustomVertex *)w1, n, end - n );
++                break;
++            }
++            case F3D_TRI1:
++                f3d_triangle( ((w0 >> 16) & 0xFF) / 2, ((w0 >> 8) & 0xFF) / 2, (w0 & 0xFF) / 2 );
++                break;
++            case F3D_TRI2:
++            case F3D_TRI2_EXT:
++                f3d_triangle( ((w0 >> 16) & 0xFF) / 2, ((w0 >> 8) & 0xFF) / 2, (w0 & 0xFF) / 2 );
++                f3d_triangle( ((w1l >> 16) & 0xFF) / 2, ((w1l >> 8) & 0xFF) / 2, (w1l & 0xFF) / 2 );
++                break;
++            case F3D_QUAD:
++                f3d_triangle( ((w0 >> 16) & 0xFF) / 2, ((w0 >> 8) & 0xFF) / 2, (w0 & 0xFF) / 2 );
++                f3d_triangle( ((w1l >> 16) & 0xFF) / 2, ((w1l >> 8) & 0xFF) / 2, (w1l & 0xFF) / 2 );
++                break;
++            case F3D_DL:
++                if( ((w0 >> 16) & 1) == 0 )
++                {
++                    if( is_custom_display_list( (const void *)w1 ))
++                        process_f3d_display_list( (const uintptr_t *)w1, depth + 1 );
++                }
++                else
++                {
++                    // branch: continue there, don't come back
++                    if( !is_custom_display_list( (const void *)w1 )) return;
++                    cmd = (const uintptr_t *)w1;
++                    continue;
++                }
++                break;
++            case F3D_ENDDL:
++                return;
++            case F3D_GEOMETRYMODE:
++                s_f3d.geometryMode = (s_f3d.geometryMode & (w0 & 0x00FFFFFFu)) | w1l;
++                break;
++            case F3D_TEXTURE:
++                s_f3d.scaleS = (uint16_t)(w1l >> 16);
++                s_f3d.scaleT = (uint16_t)w1l;
++                s_f3d.textureOn = ((w0 >> 1) & 0x7F) != 0;
++                break;
++            case F3D_MOVEMEM:
++                if( (w0 & 0xFF) == F3D_MV_LIGHT && w1 )
++                {
++                    int idx = (int)(((w0 >> 8) & 0xFF) * 8) / 24 - 2;
++                    if( idx >= 0 && idx < F3D_MAX_LIGHTS ) memcpy( s_f3d.lights[idx], (const void *)w1, 3 );
++                }
++                break;
++            case F3D_COPYMEM:
++                if( (w0 & 0xFF) == F3D_MV_LIGHT )
++                {
++                    int dst = (int)(((w0 >> 8) & 0xFF) * 8) / 24 - 2;
++                    int src = (int)(((w0 >> 16) & 0xFF) * 8) / 24 - 2;
++                    if( dst >= 0 && src >= 0 && dst < F3D_MAX_LIGHTS && src < F3D_MAX_LIGHTS )
++                        memcpy( s_f3d.lights[dst], s_f3d.lights[src], 3 );
++                }
++                break;
++            case F3D_MOVEWORD:
++                if( ((w0 >> 16) & 0xFF) == F3D_MW_LIGHTCOL )
++                {
++                    int idx = (int)(w0 & 0xFFFF) / 24;
++                    if( idx >= 0 && idx < F3D_MAX_LIGHTS )
++                    {
++                        s_f3d.lights[idx][0] = (uint8_t)(w1l >> 24);
++                        s_f3d.lights[idx][1] = (uint8_t)(w1l >> 16);
++                        s_f3d.lights[idx][2] = (uint8_t)(w1l >> 8);
++                    }
++                }
++                break;
++            case F3D_PPARTTOCOLOR:
++            {
++                int idx = (int)w1l - 1; // light index
++                if( idx >= 0 && idx < F3D_MAX_LIGHTS )
++                {
++                    uint8_t *target = ((w0 >> 16) & 0xFF) == 0 ? s_f3d.prim : s_f3d.env;
++                    memcpy( target, s_f3d.lights[idx], 3 );
++                }
++                break;
++            }
++            case F3D_SETOTHERMODE_L:
++                f3d_set_other_mode( &s_f3d.otherModeL, w0, w1l );
++                break;
++            case F3D_SETOTHERMODE_H:
++                f3d_set_other_mode( &s_f3d.otherModeH, w0, w1l );
++                break;
++            case F3D_SETTIMG:
++                s_f3d.image = (const struct SM64CustomTexture *)w1;
++                break;
++            case F3D_LOADBLOCK:
++            case F3D_LOADTILE:
++                s_f3d.tile = s_f3d.image;
++                break;
++            case F3D_SETTILE:
++                if( ((w1l >> 24) & 7) == 0 ) // the render tile
++                {
++                    s_f3d.cmt = (w1l >> 18) & 3;
++                    s_f3d.maskt = (w1l >> 14) & 0xF;
++                    s_f3d.cms = (w1l >> 8) & 3;
++                    s_f3d.masks = (w1l >> 4) & 0xF;
++                }
++                break;
++            case F3D_SETTILESIZE:
++                if( ((w1l >> 24) & 7) == 0 )
++                {
++                    s_f3d.uls = (w0 >> 12) & 0xFFF;
++                    s_f3d.ult = w0 & 0xFFF;
++                }
++                break;
++            case F3D_SETPRIMCOLOR:
++                s_f3d.prim[0] = (uint8_t)(w1l >> 24); s_f3d.prim[1] = (uint8_t)(w1l >> 16);
++                s_f3d.prim[2] = (uint8_t)(w1l >> 8);  s_f3d.prim[3] = (uint8_t)w1l;
++                break;
++            case F3D_SETENVCOLOR:
++                s_f3d.env[0] = (uint8_t)(w1l >> 24); s_f3d.env[1] = (uint8_t)(w1l >> 16);
++                s_f3d.env[2] = (uint8_t)(w1l >> 8);  s_f3d.env[3] = (uint8_t)w1l;
++                break;
++            case F3D_SETENVRGB:
++                s_f3d.env[0] = (uint8_t)(w1l >> 24); s_f3d.env[1] = (uint8_t)(w1l >> 16);
++                s_f3d.env[2] = (uint8_t)(w1l >> 8);
++                break;
++            case F3D_SETCOMBINE:
++                s_f3d.combine0 = w0 & 0x00FFFFFFu;
++                s_f3d.combine1 = w1l;
++                break;
++            default:
++                break;
++        }
++        cmd += 2;
++    }
++}
++
+ void gSPMatrix( void *pkt, Mtx *m, uint8_t flags )
+ {
+     guMtxL2F( s_curMatrix, m );
+@@ -206,6 +767,11 @@ void gSPDisplayList( void *pkt, struct DisplayListNode *dl )
+     process_display_list( (void*)dl );
+ }
+ 
++void gfx_adapter_set_layer( int layer )
++{
++    s_layer = layer;
++}
++
+ void gfx_adapter_bind_output_buffers( struct SM64MarioGeometryBuffers *outBuffers )
+ {
+     s_outBuffers = outBuffers;
+@@ -213,5 +779,9 @@ void gfx_adapter_bind_output_buffers( struct SM64MarioGeometryBuffers *outBuffer
+     s_colorPtr = s_outBuffers->color;
+     s_normalPtr = s_outBuffers->normal;
+     s_uvPtr = s_outBuffers->uv;
++    s_materialPtr = s_outBuffers->material;
+     s_outBuffers->numTrianglesUsed = 0;
+-}
+\ No newline at end of file
++    s_layer = 1;
++    s_f3dCommands = 0;
++    f3d_reset();
++}
+diff --git a/src/gfx_adapter.h b/src/gfx_adapter.h
+index 5d1ef49..f8aeaa3 100644
+--- a/src/gfx_adapter.h
++++ b/src/gfx_adapter.h
+@@ -12,4 +12,9 @@
+ extern void gSPMatrix( void *pkt, Mtx *m, uint8_t flags );
+ extern void gSPDisplayList( void *pkt, struct DisplayListNode *dl );
+ 
+-extern void gfx_adapter_bind_output_buffers( struct SM64MarioGeometryBuffers *outBuffers );
+\ No newline at end of file
++extern void gfx_adapter_bind_output_buffers( struct SM64MarioGeometryBuffers *outBuffers );
++
++// Mario Mode
++extern void gfx_adapter_set_layer( int layer );
++extern void gfx_adapter_set_custom_display_lists( const void *begin, const void *end );
++extern void sm64_set_player_palette_internal( const uint8_t rgb[8][3] );
+diff --git a/src/libsm64.c b/src/libsm64.c
+index b7db0b1..df69536 100644
+--- a/src/libsm64.c
++++ b/src/libsm64.c
+@@ -28,6 +28,8 @@
+ #include "decomp/mario/geo.inc.h"
+ #include "decomp/game/platform_displacement.h"
+ #include "decomp/game/sound_init.h"
++#include "decomp/game/mario_misc.h"
++#include "decomp/game/behavior_actions.h"
+ 
+ #include "debug_print.h"
+ #include "load_surfaces.h"
+@@ -41,6 +43,11 @@
+ static struct AllocOnlyPool *s_mario_geo_pool = NULL;
+ static struct GraphNode *s_mario_graph_node = NULL;
+ 
++// Mario Mode: the geo layout new Marios use (NULL: Mario's own) and whether
++// the graph has to be built again.
++static const void *s_custom_geo = NULL;
++static bool s_geo_dirty = false;
++
+ static bool s_init_global = false;
+ static bool s_init_one_mario = false;
+ 
+@@ -177,11 +184,20 @@ SM64_LIB_FN int32_t sm64_mario_create( float x, float y, float z )
+     newInstance->globalState = global_state_create();
+     global_state_bind( newInstance->globalState );
+ 
+-    if( !s_init_one_mario )
++    if( !s_init_one_mario || s_geo_dirty )
+     {
+         s_init_one_mario = true;
++        s_geo_dirty = false;
++        if( s_mario_geo_pool )
++            alloc_only_pool_free( s_mario_geo_pool );
+         s_mario_geo_pool = alloc_only_pool_init();
+-        s_mario_graph_node = process_geo_layout( s_mario_geo_pool, mario_geo_ptr );
++        s_mario_graph_node = s_custom_geo ? process_geo_layout( s_mario_geo_pool, (void *)s_custom_geo ) : NULL;
++        if( s_mario_graph_node == NULL )
++        {
++            if( s_custom_geo ) DEBUG_PRINT("custom geo layout produced no graph - using Mario's own");
++            gfx_adapter_set_custom_display_lists( NULL, NULL );
++            s_mario_graph_node = process_geo_layout( s_mario_geo_pool, mario_geo_ptr );
++        }
+     }
+ 
+     gCurrSaveFileNum = 1;
+@@ -725,3 +741,58 @@ SM64_LIB_FN void sm64_set_sound_volume(float vol)
+ {
+     gAudioVolume = vol;
+ }
++
++/*
++ * Mario Mode: custom models.
++ */
++
++Gfx *sm64_geo_asm_stub( s32 callContext, struct GraphNode *node, void *context )
++{
++    return NULL;
++}
++
++Gfx *sm64_geo_switch_stub( s32 callContext, struct GraphNode *node, void *context )
++{
++    if( callContext == GEO_CONTEXT_RENDER )
++        ((struct GraphNodeSwitchCase *)node)->selectedCase = 0;
++    return NULL;
++}
++
++SM64_LIB_FN void sm64_set_mario_geo( const void *geoLayout, const void *dlBegin, const void *dlEnd )
++{
++    s_custom_geo = geoLayout;
++    gfx_adapter_set_custom_display_lists( geoLayout ? dlBegin : NULL, geoLayout ? dlEnd : NULL );
++    s_geo_dirty = true;
++}
++
++SM64_LIB_FN const void *sm64_get_geo_function( const char *name )
++{
++    static const struct { const char *name; const void *fn; } table[] = {
++        { "geo_mirror_mario_set_alpha", (const void *)geo_mirror_mario_set_alpha },
++        { "geo_switch_mario_stand_run", (const void *)geo_switch_mario_stand_run },
++        { "geo_switch_mario_eyes", (const void *)geo_switch_mario_eyes },
++        { "geo_mario_tilt_torso", (const void *)geo_mario_tilt_torso },
++        { "geo_mario_head_rotation", (const void *)geo_mario_head_rotation },
++        { "geo_switch_mario_hand", (const void *)geo_switch_mario_hand },
++        { "geo_mario_hand_foot_scaler", (const void *)geo_mario_hand_foot_scaler },
++        { "geo_switch_mario_cap_effect", (const void *)geo_switch_mario_cap_effect },
++        { "geo_switch_mario_cap_on_off", (const void *)geo_switch_mario_cap_on_off },
++        { "geo_mario_rotate_wing_cap_wings", (const void *)geo_mario_rotate_wing_cap_wings },
++        { "geo_switch_mario_hand_grab_pos", (const void *)geo_switch_mario_hand_grab_pos },
++        { "geo_render_mirror_mario", (const void *)geo_render_mirror_mario },
++        { "geo_mirror_mario_backface_culling", (const void *)geo_mirror_mario_backface_culling },
++        { "geo_move_mario_part_from_parent", (const void *)geo_move_mario_part_from_parent },
++        { "sm64_geo_asm_stub", (const void *)sm64_geo_asm_stub },
++        { "sm64_geo_switch_stub", (const void *)sm64_geo_switch_stub },
++    };
++    if( !name ) return NULL;
++    for( size_t i = 0; i < sizeof( table ) / sizeof( table[0] ); ++i )
++        if( strcmp( table[i].name, name ) == 0 )
++            return table[i].fn;
++    return NULL;
++}
++
++SM64_LIB_FN void sm64_set_player_palette( const uint8_t rgb[8][3] )
++{
++    if( rgb ) sm64_set_player_palette_internal( rgb );
++}
+diff --git a/src/libsm64.h b/src/libsm64.h
+index 1f6c5e4..ba245a6 100644
+--- a/src/libsm64.h
++++ b/src/libsm64.h
+@@ -75,6 +75,42 @@ struct SM64MarioGeometryBuffers
+     float *color;
+     float *uv;
+     uint16_t numTrianglesUsed;
++    uint32_t *material; // Mario Mode: one SM64_MAT_* word per triangle (may be NULL)
++};
++
++/*
++ * Mario Mode additions: custom Mario models (DynOS-style F3DEX2 display lists
++ * and geo layouts) and a material word per output triangle.
++ */
++
++// The material word of a triangle.
++#define SM64_MAT_TEXTURE_MASK  0x000003FFu // texture slot (0: the ROM atlas from sm64_global_init)
++#define SM64_MAT_COLOR_SHIFT   10          // colour: 0 vertex colour, 1 texture x colour,
++                                           // 2 colour blended to the texture by its alpha, 3 texture
++#define SM64_MAT_ALPHA_SHIFT   12          // alpha: 0 opaque, 1 texture alpha x A, 2 A
++#define SM64_MAT_CUTOUT        0x00004000u // alpha below 0.5 is cut out
++#define SM64_MAT_DITHER        0x00008000u // see-through: alpha is dithered
++#define SM64_MAT_TEXTURED      0x00010000u
++#define SM64_MAT_WRAP_S_SHIFT  17          // 0 repeat, 1 mirror, 2 clamp
++#define SM64_MAT_WRAP_T_SHIFT  19
++#define SM64_MAT_A_SHIFT       24          // A: constant alpha 0..255
++
++// A texture of a custom model. `slot` is the material's texture slot; uv
++// coordinates of its triangles are in units of the whole texture (0..1 once).
++struct SM64CustomTexture
++{
++    uint32_t slot;
++    uint32_t width, height;
++};
++
++// A vertex of a custom model (G_VTX points at these). cn: colour (rgb a) when
++// lighting is off, else a normal (xyz) and alpha.
++struct SM64CustomVertex
++{
++    float pos[3];
++    uint16_t flag;
++    int16_t st[2];
++    uint8_t cn[4];
+ };
+ 
+ struct SM64WallCollisionData
+@@ -137,7 +173,7 @@ enum
+ {
+     SM64_TEXTURE_WIDTH = 64 * 11,
+     SM64_TEXTURE_HEIGHT = 64,
+-    SM64_GEO_MAX_TRIANGLES = 1024,
++    SM64_GEO_MAX_TRIANGLES = 4096, // Mario Mode: custom models may have more than Mario's 1024
+ };
+ 
+ 
+@@ -198,6 +234,19 @@ extern SM64_LIB_FN void sm64_play_music(uint8_t player, uint16_t seqArgs, uint16
+ extern SM64_LIB_FN void sm64_stop_background_music(uint16_t seqId);
+ extern SM64_LIB_FN void sm64_fadeout_background_music(uint16_t arg0, uint16_t fadeOut);
+ extern SM64_LIB_FN uint16_t sm64_get_current_background_music();
++
++// Mario Mode: custom models.
++// The geo layout Marios created from now on use (NULL: Mario's own). Its
++// display lists are F3DEX2 command pairs (64-bit words, pointers in w1) that
++// lie in [dlBegin, dlEnd); G_SETTIMG points at SM64CustomTexture, G_VTX at
++// SM64CustomVertex, G_MOVEMEM lights at Light/Ambient structures.
++extern SM64_LIB_FN void sm64_set_mario_geo( const void *geoLayout, const void *dlBegin, const void *dlEnd );
++// Mario's geo functions by name (geo_switch_mario_eyes, ...), or stand-ins:
++// "sm64_geo_asm_stub" (draws nothing) and "sm64_geo_switch_stub" (case 0).
++extern SM64_LIB_FN const void *sm64_get_geo_function( const char *name );
++// The colours of the player parts custom models copy (overalls, shirt,
++// gloves, shoes, hair, skin, cap, emblem).
++extern SM64_LIB_FN void sm64_set_player_palette( const uint8_t rgb[8][3] );
+ extern SM64_LIB_FN void sm64_play_sound(int32_t soundBits, float *pos);
+ extern SM64_LIB_FN void sm64_play_sound_global(int32_t soundBits);
+ extern SM64_LIB_FN void sm64_set_sound_volume(float vol);

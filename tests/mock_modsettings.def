@@ -1,0 +1,15 @@
+; The ModSettings API under its MSVC-decorated names (as in ModSettings'
+; import library), mapped onto tests/mock_modsettings.cpp.
+LIBRARY ModSettings
+EXPORTS
+    "??0BaseMenu@@QEAA@XZ" = BaseMenuCtor
+    "?Header@BaseMenu@@QEAAXPEBD@Z" = BaseMenuHeader
+    "?Toggle@BaseMenu@@QEAAXPEBD0PEAHV?$function@$$A6AXXZ@std@@@Z" = BaseMenuToggle
+    "?Option@BaseMenu@@QEAAXPEBD0PEAHPEAPEBDHV?$function@$$A6AXXZ@std@@@Z" = BaseMenuOption
+    "?Slider@BaseMenu@@QEAAXPEBD0PEAMAEAUSliderOpts@1@V?$function@$$A6AXXZ@std@@@Z" = BaseMenuSlider
+    "?RegisterMenu@ModSettings@@YAXPEAVModMenu@@@Z" = ModSettingsRegisterMenu
+    "?RegisterSaveCallback@ModSettings@@YAXV?$function@$$A6AXXZ@std@@@Z" = ModSettingsRegisterSaveCallback
+    MockModSettings_Open
+    MockModSettings_Set
+    MockModSettings_Save
+    MockModSettings_Calls

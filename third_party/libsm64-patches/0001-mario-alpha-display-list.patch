@@ -1,0 +1,32 @@
+diff --git a/src/decomp/game/mario_misc.c b/src/decomp/game/mario_misc.c
+index db63906..9a5b951 100644
+--- a/src/decomp/game/mario_misc.c
++++ b/src/decomp/game/mario_misc.c
+@@ -305,22 +305,16 @@ void bhv_unlock_door_star_loop(void) {
+  * Generate a display list that sets the correct blend mode and color for mirror Mario.
+  */
+ static Gfx *make_gfx_mario_alpha(struct GraphNodeGenerated *node, s16 alpha) {
+-    Gfx *gfx;
+-    Gfx *gfxHead = NULL;
+-
+     if (alpha == 255) {
+         node->fnNode.node.flags = (node->fnNode.node.flags & 0xFF) | (LAYER_OPAQUE << 8);
+-        gfxHead = alloc_display_list(2 * sizeof(*gfxHead));
+-        gfx = gfxHead;
+     } else {
+         node->fnNode.node.flags = (node->fnNode.node.flags & 0xFF) | (LAYER_TRANSPARENT << 8);
+-        gfxHead = alloc_display_list(3 * sizeof(*gfxHead));
+-        gfx = gfxHead;
+-        gDPSetAlphaCompare(gfx++, G_AC_DITHER);
+     }
+-    gDPSetEnvColor(gfx++, 255, 255, 255, alpha);
+-    gSPEndDisplayList(gfx);
+-    return gfxHead;
++    // libsm64's display list adapter only understands its own commands
++    // (gfx_macros.h). The N64 blend/colour commands built here made it read
++    // past the end of the list into the heap - a crash with the vanish cap.
++    // There is nothing for it to draw in them: no list.
++    return NULL;
+ }
+ 
+ /**
