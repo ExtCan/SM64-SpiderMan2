@@ -1,0 +1,18 @@
+Mario Mode needs your own copy of Super Mario 64 (USA).
+
+Put the ROM in THIS folder. Any of these works:
+  - .z64 (big-endian), .n64 (little-endian) or .v64 (byte-swapped)
+  - any file name; sm64.us.z64 is checked first
+
+Only the unmodified US version is accepted:
+  SHA-1 (as .z64) 9bef1128717f958171a4afac3ed78ee2bb4e86ce
+The Japanese, European and Shindou versions are recognised and rejected
+with a message in sm2mario.log.
+
+Mario's textures, animations, voice and sound effects are read from this ROM
+at start-up. Nothing from it is copied anywhere else.
+
+This folder (<game>\sm2mario) is yours: Overstrike deletes and recreates the
+game's "scripts" folder every time you press "Install mods", but it never
+touches this one. Your settings (sm2mario.ini), binding overrides
+(bindings.user.ini) and the log (sm2mario.log) live here too.

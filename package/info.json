@@ -1,0 +1,10 @@
+{
+    "name": "Mario Mode (libsm64)",
+    "type": "script",
+    "author": "",
+    "version": "0.6.1",
+    "dependencies": [],
+
+    "game": "MSM2",
+    "format_version": 1
+}
