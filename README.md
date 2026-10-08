@@ -4,13 +4,6 @@ Press **M** and Spider-Man is replaced by Super Mario 64's Mario: the real SM64 
 
 It installs as an Overstrike `.script` mod.
 
-> **Status: v0.6.1.** Your 0.6.0 playtest left three problems: the camera sits far too close with no way to change it, in flight it snaps close and far every frame, and the pixel glitch is still there (your picture: red copies of Mario's cap stacked above his head in mid-air). Your log showed what was behind the last two. 0.6.1 fixes all three (details in [What changed in 0.6.1](#what-changed-in-061)):
-> - **Camera distance.** A new setting, **CAMERA DISTANCE**, in the F8 menu, on the pause menu's MARIO MODE page and as `[Camera] Distance`: from 0.5× to 3× the game's own distance for Spider-Man. It starts at 1.5×, so the camera already sits further back than in 0.6.0. Walls still bring it in.
-> - **Snapping in flight.** Spider-Man 2 has several cameras and switches between them. 0.6.0 only moved the one it found first, so every frame the game showed from another one came from wherever the game had that one, further back: the snapping you saw in flight. In the busiest minute of your log, 992 of 3,648 frames came from a camera the mod hadn't moved. Now the mod notices a frame shown from a spot where it didn't put a camera, works out which of the game's cameras was there, and moves that one around Mario too. If the game then stops using its first camera, the other one simply takes over, without the game's own camera showing in between.
-> - **The pixel glitch.** Each time the view jumped between the near and the far camera, Mario's motion vectors said he had moved a long way across the screen in one frame. The game's motion blur works on blocks of pixels, each blurred along the fastest motion around it, and it smeared him along that motion: the stacked, blocky copies of his cap in your picture. With every camera moved, those jumps are gone. And whenever the camera does jump against Mario by more than a metre in one frame (a camera the mod can't move, or a wall bringing it in at once), his motion vectors now leave the jump out, so there is nothing to smear.
->
-> Like 0.5 and 0.6, 0.6.1 is tested here with SM64's real code and your ROM, in a stand-in game built like Spider-Man 2, **not yet in the real game**. The stand-in now has a second camera, 3 m further back, that it shows every other frame, the way your log describes. With 0.6.0 the view jumps back and forth between the two, Mario jumps about 171 px on screen and his motion vectors reach 32 px where it switches; with 0.6.1 the view stays behind him, he moves 15 px (his animation), and the motion vectors are 5.5 px. Read [What's verified](#whats-verified-and-what-isnt). If something misbehaves, please send `sm2mario.log`.
-
 ---
 
 ## Install
