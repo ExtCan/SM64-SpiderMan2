@@ -4,6 +4,10 @@ Press **M** and Spider-Man is replaced by Super Mario 64's Mario: the real SM64 
 
 It installs as an Overstrike `.script` mod.
 
+<img width="3440" height="1440" alt="2651280_20261002174348_1" src="https://github.com/user-attachments/assets/54a65a98-16d3-4d02-a7eb-a5c67586505d" />
+<img width="3440" height="1440" alt="2651280_20261002174228_1" src="https://github.com/user-attachments/assets/557dd834-2c96-43c9-85ac-1ea8fd47af64" />
+
+
 ---
 
 ## Install
